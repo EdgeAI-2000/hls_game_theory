@@ -1,0 +1,33 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+*.log
+*.pid
+*.tmp
+*.swp
+.env
+.env.*
+
+# Local model weights and generated artifacts
+models/
+checkpoints/
+outputs/
+runs/
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+*.npz
+*.npy
+*.jsonl
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store

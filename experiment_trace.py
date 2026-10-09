@@ -1,0 +1,542 @@
+"""
+Trace and metric helpers for MASK Gate1 experiments.
+
+The trace schema is intentionally JSONL-first so E1/E2/E6 can share the same
+raw records.  Current experiments may use a heuristic fallback backend; the
+backend field must be kept in reports to avoid treating smoke-test numbers as
+trained LLM results.
+"""
+
+from __future__ import annotations
+
+import bisect
+import json
+import os
+import random
+import sys
+from collections import Counter, defaultdict
+from math import comb
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+
+
+def ensure_deterministic_hashing() -> None:
+    """Re-exec the process once with PYTHONHASHSEED=0 for reproducibility.
+
+    The mahjong engine iterates ``set(...)`` during play, so without a fixed
+    hash seed two identical runs diverge (different gameplay -> different sample
+    counts and metrics).  Call this as the first line of an experiment ``main()``
+    so the gate decision is reproducible.
+    """
+    if os.environ.get("PYTHONHASHSEED") != "0":
+        os.environ["PYTHONHASHSEED"] = "0"
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+def write_jsonl(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+
+
+def write_json(path: Path, data: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+
+
+def binary_auc(labels: List[int], scores: List[float]) -> Optional[float]:
+    positives = [(s, i) for i, (y, s) in enumerate(zip(labels, scores)) if y == 1]
+    negatives = [(s, i) for i, (y, s) in enumerate(zip(labels, scores)) if y == 0]
+    if not positives or not negatives:
+        return None
+
+    wins = 0.0
+    total = len(positives) * len(negatives)
+    for ps, _ in positives:
+        for ns, _ in negatives:
+            if ps > ns:
+                wins += 1.0
+            elif ps == ns:
+                wins += 0.5
+    return wins / total
+
+
+def calibration_error(labels: List[int], scores: List[float], bins: int = 10) -> Optional[float]:
+    if not labels:
+        return None
+    buckets: Dict[int, List[tuple[int, float]]] = defaultdict(list)
+    for label, score in zip(labels, scores):
+        idx = min(bins - 1, max(0, int(score * bins)))
+        buckets[idx].append((label, score))
+
+    ece = 0.0
+    n = len(labels)
+    for values in buckets.values():
+        conf = sum(score for _, score in values) / len(values)
+        acc = sum(label for label, _ in values) / len(values)
+        ece += (len(values) / n) * abs(conf - acc)
+    return ece
+
+
+def brier_score(labels: List[int], scores: List[float]) -> Optional[float]:
+    """Mean squared error against binary outcomes: a strictly proper scoring rule.
+
+    Unlike absolute error to a soft target (BSE), Brier rewards calibration *and*
+    discrimination, so a constant base-rate predictor cannot game it on a
+    class-balanced evaluation set.
+    """
+    if not labels:
+        return None
+    return sum((s - y) ** 2 for y, s in zip(labels, scores)) / len(labels)
+
+
+def fit_isotonic(pairs: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    """Pool-Adjacent-Violators isotonic regression.
+
+    ``pairs`` are (score, target) points; the returned step function is
+    non-decreasing in score, so applying it never inverts the ranking (AUC is
+    preserved up to ties).  Targets are usually binary outcomes, giving a
+    calibrated P(positive | score).
+    """
+    pts = sorted(pairs, key=lambda p: p[0])
+    if not pts:
+        return [(1.0, 0.5)]
+    # blocks: [sum_target, count, score_right]
+    blocks: List[List[float]] = []
+    for score, target in pts:
+        blocks.append([float(target), 1.0, float(score)])
+        while len(blocks) >= 2 and blocks[-2][0] / blocks[-2][1] >= blocks[-1][0] / blocks[-1][1]:
+            s2, c2, x2 = blocks.pop()
+            s1, c1, _ = blocks.pop()
+            blocks.append([s1 + s2, c1 + c2, x2])
+    return [(x_right, s / c) for s, c, x_right in blocks]
+
+
+def apply_isotonic(steps: List[Tuple[float, float]], score: float) -> float:
+    if not steps:
+        return max(0.0, min(1.0, score))
+    thresholds = [x for x, _ in steps]
+    idx = bisect.bisect_left(thresholds, score)
+    if idx >= len(steps):
+        idx = len(steps) - 1
+    return max(0.0, min(1.0, steps[idx][1]))
+
+
+def balance_by_binary(
+    rows: List[Dict[str, Any]],
+    label_fn: Callable[[Dict[str, Any]], int],
+    seed: int = 12345,
+) -> Tuple[List[Dict[str, Any]], bool]:
+    """Subsample a list to an equal number of positives and negatives.
+
+    No oversampling/duplication, so the balanced subset stays leakage-safe.
+    Returns ``(subset, True)`` when both classes exist, else ``(rows, False)``.
+    """
+    pos = [r for r in rows if label_fn(r) == 1]
+    neg = [r for r in rows if label_fn(r) == 0]
+    if not pos or not neg:
+        return list(rows), False
+    k = min(len(pos), len(neg))
+    rng = random.Random(seed)
+    rng.shuffle(pos)
+    rng.shuffle(neg)
+    out = pos[:k] + neg[:k]
+    rng.shuffle(out)
+    return out, True
+
+
+def summarize_belief_samples(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not samples:
+        return {
+            "samples": 0,
+            "note": "No belief samples were collected.",
+        }
+
+    labels = [int(s["true_tenpai"]) for s in samples]
+    scores = [float(s["tenpai_confidence"]) for s in samples]
+    preds = [1 if s.get("think_i_am_tenpai") == "yes" or float(s["tenpai_confidence"]) >= 0.5 else 0 for s in samples]
+
+    return {
+        "samples": len(samples),
+        "positive_rate": sum(labels) / len(labels),
+        "accuracy": sum(1 for y, p in zip(labels, preds) if y == p) / len(labels),
+        "auc": binary_auc(labels, scores),
+        "brier": sum((score - y) ** 2 for y, score in zip(labels, scores)) / len(labels),
+        "bse_abs": sum(abs(score - y) for y, score in zip(labels, scores)) / len(labels),
+        "ece": calibration_error(labels, scores),
+        "backend_counts": dict(Counter(s.get("backend", "unknown") for s in samples)),
+        "label_scope": "current minimal oracle: true P0 tenpai, not a full opponent-posterior oracle yet",
+    }
+
+
+def percentile(values: List[float], p: float) -> float:
+    if not values:
+        return 0.0
+    values = sorted(values)
+    idx = min(len(values) - 1, int(round((len(values) - 1) * p)))
+    return values[idx]
+
+
+def lower_tail_mean(values: List[float], alpha: float = 0.10) -> float:
+    """Empirical lower-tail CVaR with at least one observation."""
+    if not values:
+        return 0.0
+    count = max(1, int(len(values) * alpha + 0.999999))
+    return sum(sorted(values)[:count]) / count
+
+
+def summarize_games(games: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not games:
+        return {"games": 0}
+
+    n = len(games)
+    nets = [float(g["agent_net"]) for g in games]
+    sorted_nets = sorted(nets)
+    trim = int(0.10 * n)
+    trimmed_nets = sorted_nets[trim:n - trim] if trim and n > 2 * trim else sorted_nets
+    net_mean = sum(nets) / n
+    net_std = (sum((value - net_mean) ** 2 for value in nets) / n) ** 0.5
+    central_nets = [value for value in nets if abs(value) <= 500.0]
+    extreme_positive = [value for value in nets if value >= 2500.0]
+    extreme_negative = [value for value in nets if value <= -2500.0]
+    times = [t for g in games for t in g.get("decision_ms", [])]
+    mode_counts = Counter()
+    for g in games:
+        mode_counts.update(g.get("mode_counts", {}))
+
+    deceive_windows = sum(int(g.get("deceive_windows", 0)) for g in games)
+    induced_dealins = sum(int(g.get("induced_dealin", 0)) for g in games)
+    false_fold_opps = sum(int(g.get("false_fold_opportunities", 0)) for g in games)
+    false_folds = sum(int(g.get("false_folds", 0)) for g in games)
+    strict_event_opps = sum(
+        int(g.get("strict_ffr_event_opportunities", 0)) for g in games
+    )
+    strict_event_false = sum(
+        int(g.get("strict_false_fold_events", 0)) for g in games
+    )
+    switch_opps = sum(
+        int(g.get("conditional_defensive_switch_opportunities", 0)) for g in games
+    )
+    switches = sum(
+        int(g.get("conditional_defensive_switches", 0)) for g in games
+    )
+    gang_opps = sum(int(g.get("declined_self_gang_opportunities", 0)) for g in games)
+    declined_gangs = sum(int(g.get("declined_self_gangs", 0)) for g in games)
+    reranker_enabled = sum(int(g.get("reranker_enabled_states", 0)) for g in games)
+    reranker_used = sum(int(g.get("reranker_used_states", 0)) for g in games)
+    reranker_changed = sum(int(g.get("reranker_changed_actions", 0)) for g in games)
+    reranker_parsed = sum(int(g.get("reranker_parsed_outputs", 0)) for g in games)
+    safe_overrides = sum(int(g.get("safe_overrides", 0)) for g in games)
+    blocked_call_states = sum(int(g.get("blocked_call_while_missing_states", 0)) for g in games)
+    blocked_call_counts = Counter()
+    for game in games:
+        blocked_call_counts.update(game.get("blocked_call_while_missing_counts", {}))
+    hu_available = sum(int(g.get("hu_available_count", 0)) for g in games)
+    hu_selected = sum(int(g.get("hu_selected_count", 0)) for g in games)
+    missed_hu = sum(int(g.get("missed_hu_count", 0)) for g in games)
+    hu_available_turns = sum(int(g.get("hu_available_turns", 0)) for g in games)
+    hu_selected_turns = sum(int(g.get("hu_selected_turns", 0)) for g in games)
+    missed_hu_turns = sum(int(g.get("missed_hu_turns", 0)) for g in games)
+    hu_available_responses = sum(int(g.get("hu_available_responses", 0)) for g in games)
+    hu_selected_responses = sum(int(g.get("hu_selected_responses", 0)) for g in games)
+    missed_hu_responses = sum(int(g.get("missed_hu_responses", 0)) for g in games)
+    missed_hu_value_floor = sum(float(g.get("missed_hu_value_floor", 0.0)) for g in games)
+    learned_gate_used = sum(int(g.get("learned_gate_used_states", 0)) for g in games)
+    learned_gate_parsed = sum(int(g.get("learned_gate_parsed_outputs", 0)) for g in games)
+    learned_gate_modes = Counter()
+    for game in games:
+        learned_gate_modes.update(game.get("learned_gate_mode_counts", {}))
+    non_hu = [g for g in games if not g.get("agent_hu")]
+    final_shantens = [
+        int(g["agent_final_shanten"])
+        for g in non_hu
+        if g.get("agent_final_shanten") is not None
+    ]
+    hu_games = [g for g in games if g.get("agent_hu")]
+    dealin_games = [g for g in games if g.get("agent_dealin")]
+    neither_games = [
+        g for g in games if not g.get("agent_hu") and not g.get("agent_dealin")
+    ]
+
+    settlement_kinds = ("hu_self_draw", "hu_discard", "hua_zhu", "da_jiao")
+    settlement_net = {
+        kind: sum(
+            float((g.get("settlement_breakdown") or {}).get("net", {}).get(kind, 0.0))
+            for g in games
+        )
+        for kind in settlement_kinds
+    }
+    settlement_paid = {
+        kind: sum(
+            float((g.get("settlement_breakdown") or {}).get("paid", {}).get(kind, 0.0))
+            for g in games
+        )
+        for kind in settlement_kinds
+    }
+    settlement_received = {
+        kind: sum(
+            float((g.get("settlement_breakdown") or {}).get("received", {}).get(kind, 0.0))
+            for g in games
+        )
+        for kind in settlement_kinds
+    }
+    reconciled_rows = [g for g in games if "settlement_reconciled" in g]
+
+    def conditional_net(rows: List[Dict[str, Any]]) -> Optional[float]:
+        return sum(float(g["agent_net"]) for g in rows) / len(rows) if rows else None
+
+    return {
+        "games": n,
+        "avg_net": net_mean,
+        "net_distribution": {
+            "median": percentile(nets, 0.50),
+            "std": net_std,
+            "trimmed_mean_10pct": sum(trimmed_nets) / len(trimmed_nets),
+            "p10": percentile(nets, 0.10),
+            "p90": percentile(nets, 0.90),
+            "min": sorted_nets[0],
+            "max": sorted_nets[-1],
+            "positive_rate": sum(value > 0 for value in nets) / n,
+            "negative_rate": sum(value < 0 for value in nets) / n,
+            "zero_rate": sum(value == 0 for value in nets) / n,
+            "central_abs_500": {
+                "games": len(central_nets),
+                "rate": len(central_nets) / n,
+                "mean": sum(central_nets) / len(central_nets) if central_nets else None,
+            },
+            "extreme_positive_2500": {
+                "games": len(extreme_positive),
+                "sum": sum(extreme_positive),
+            },
+            "extreme_negative_2500": {
+                "games": len(extreme_negative),
+                "sum": sum(extreme_negative),
+            },
+        },
+        "settlement": {
+            "net_total": settlement_net,
+            "net_per_game": {kind: value / n for kind, value in settlement_net.items()},
+            "paid_total": settlement_paid,
+            "received_total": settlement_received,
+            "reconciled_games": sum(bool(g.get("settlement_reconciled")) for g in reconciled_rows),
+            "games_with_ledger": len(reconciled_rows),
+        },
+        "hu_rate": sum(1 for g in games if g.get("agent_hu")) / n,
+        "discard_hu_rate": sum(1 for g in games if g.get("agent_hu_by_discard")) / n,
+        "ron_game_rate": sum(1 for g in games if g.get("agent_hu_by_discard")) / n,
+        "hu_counts": {
+            "games": n,
+            "agent_hu_games": sum(1 for g in games if g.get("agent_hu")),
+            "agent_discard_hu_games": sum(
+                1 for g in games if g.get("agent_hu_by_discard")
+            ),
+            "unit": "game",
+            "discard_hu_definition": (
+                "Games in which P0 won from an opponent discard; this is not "
+                "the fraction of discarded tiles that complete P0's hand."
+            ),
+        },
+        "cvar_10pct": lower_tail_mean(nets, 0.10),
+        "avg_hu_fan": (
+            sum(float(g.get("agent_hu_fan", 0)) for g in hu_games) / len(hu_games)
+            if hu_games else 0.0
+        ),
+        "fan_per_game": sum(float(g.get("agent_hu_fan", 0)) for g in games) / n,
+        "dealin_rate": sum(1 for g in games if g.get("agent_dealin")) / n,
+        "avg_steps": sum(float(g["steps"]) for g in games) / n,
+        "end_state": {
+            "wall_exhaustion_rate": sum(g.get("end_reason") == "wall_exhausted" for g in games) / n,
+            "three_winners_rate": sum(g.get("end_reason") == "three_winners" for g in games) / n,
+            "max_steps_or_unsettled_rate": sum(
+                g.get("end_reason") == "max_steps_or_unsettled" for g in games
+            ) / n,
+            "final_ready_rate_non_hu": (
+                sum(bool(g.get("agent_final_ready")) for g in non_hu) / len(non_hu)
+                if non_hu else 0.0
+            ),
+            "hua_zhu_rate_non_hu": (
+                sum(bool(g.get("agent_hua_zhu")) for g in non_hu) / len(non_hu)
+                if non_hu else 0.0
+            ),
+            "avg_final_shanten_non_hu": (
+                sum(final_shantens) / len(final_shantens) if final_shantens else None
+            ),
+        },
+        "conditional_net": {
+            "hu": conditional_net(hu_games),
+            "dealin": conditional_net(dealin_games),
+            "neither_hu_nor_dealin": conditional_net(neither_games),
+        },
+        "action_efficiency": {
+            "avg_shanten_regret": sum(float(g.get("avg_shanten_regret", 0.0)) for g in games) / n,
+            "positive_shanten_regret_rate": (
+                sum(float(g.get("positive_shanten_regret_rate", 0.0)) for g in games) / n
+            ),
+            "safe_overrides": safe_overrides,
+            "blocked_call_while_missing_states": blocked_call_states,
+            "blocked_call_while_missing_counts": dict(blocked_call_counts),
+        },
+        "hu_decision": {
+            "hu_available": hu_available,
+            "hu_selected": hu_selected,
+            "missed_hu": missed_hu,
+            "missed_hu_rate": missed_hu / hu_available if hu_available else 0.0,
+            "missed_hu_value_floor": missed_hu_value_floor,
+            "missed_hu_value_floor_per_game": missed_hu_value_floor / n,
+            "turn": {
+                "hu_available": hu_available_turns,
+                "hu_selected": hu_selected_turns,
+                "missed_hu": missed_hu_turns,
+                "missed_hu_rate": (
+                    missed_hu_turns / hu_available_turns if hu_available_turns else 0.0
+                ),
+            },
+            "response": {
+                "hu_available": hu_available_responses,
+                "hu_selected": hu_selected_responses,
+                "missed_hu": missed_hu_responses,
+                "missed_hu_rate": (
+                    missed_hu_responses / hu_available_responses if hu_available_responses else 0.0
+                ),
+            },
+        },
+        "learned_gate": {
+            "used_states": learned_gate_used,
+            "parsed_outputs": learned_gate_parsed,
+            "parse_rate": learned_gate_parsed / learned_gate_used if learned_gate_used else 0.0,
+            "mode_counts": dict(learned_gate_modes),
+        },
+        "DIR": induced_dealins / deceive_windows if deceive_windows else 0.0,
+        "DIR_counts": {
+            "induced_dealin": induced_dealins,
+            "deceive_windows": deceive_windows,
+        },
+        "FFR": false_folds / false_fold_opps if false_fold_opps else 0.0,
+        "FFR_counts": {
+            "false_folds": false_folds,
+            "false_fold_opportunities": false_fold_opps,
+            "unit": "first eligible decision per opponent-game",
+            "repeated_opportunities_within_game": False,
+            "note": (
+                "Strict oracle-grounded FFR for responsive/curriculum opponents: "
+                "defender shanten<=1, P0 shanten>0, and discard-vs-discard "
+                "comparison. A false fold additionally requires perceived threat "
+                "above the defensive threshold and measurable shanten or "
+                "effective-copy loss. Neural opponents use the same eligibility, "
+                "progress-loss, and first-opportunity rules, but remain separately "
+                "labeled as behavioral because they have no explicit threat threshold."
+            ),
+        },
+        "strict_FFR_event_diagnostic": (
+            strict_event_false / strict_event_opps if strict_event_opps else 0.0
+        ),
+        "strict_FFR_event_counts": {
+            "false_folds": strict_event_false,
+            "opportunities": strict_event_opps,
+            "unit": "eligible opponent turn decision",
+            "repeated_opportunities_within_game": True,
+        },
+        "conditional_defensive_switch_rate": (
+            switches / switch_opps if switch_opps else 0.0
+        ),
+        "conditional_defensive_switch_counts": {
+            "switches": switches,
+            "opportunities": switch_opps,
+            "unit": "opponent turn decision",
+            "repeated_opportunities_within_game": True,
+        },
+        "declined_self_gang_rate": declined_gangs / gang_opps if gang_opps else 0.0,
+        "declined_self_gang_counts": {
+            "declines": declined_gangs,
+            "opportunities": gang_opps,
+        },
+        "decision_latency_ms": {
+            "p50": percentile(times, 0.50),
+            "p95": percentile(times, 0.95),
+            "p99": percentile(times, 0.99),
+        },
+        "mode_counts": dict(mode_counts),
+        "candidate_reranker": {
+            "enabled_states": reranker_enabled,
+            "used_states": reranker_used,
+            "changed_actions": reranker_changed,
+            "parsed_outputs": reranker_parsed,
+            "use_rate": reranker_used / reranker_enabled if reranker_enabled else 0.0,
+            "change_rate_when_used": reranker_changed / reranker_used if reranker_used else 0.0,
+            "parse_rate_when_used": reranker_parsed / reranker_used if reranker_used else 0.0,
+        },
+    }
+
+
+def summarize_by_method(games: List[Dict[str, Any]]) -> Dict[str, Any]:
+    grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for game in games:
+        grouped[game["method"]].append(game)
+    return {method: summarize_games(rows) for method, rows in sorted(grouped.items())}
+
+
+def sign_test_p_value(deltas: List[float]) -> Optional[float]:
+    nonzero = [d for d in deltas if d != 0]
+    n = len(nonzero)
+    if n == 0:
+        return None
+    positives = sum(1 for d in nonzero if d > 0)
+    k = min(positives, n - positives)
+    tail = sum(comb(n, i) for i in range(k + 1)) / (2**n)
+    return min(1.0, 2.0 * tail)
+
+
+def paired_method_comparison(
+    games: List[Dict[str, Any]],
+    base_method: str = "llm_reactive_z",
+    target_method: str = "llm_mask",
+) -> Dict[str, Any]:
+    by_key: Dict[tuple[int, str], Dict[str, Any]] = {}
+    for game in games:
+        by_key[(int(game["seed"]), game["method"])] = game
+
+    seeds = sorted(
+        seed
+        for seed, method in by_key
+        if method == base_method and (seed, target_method) in by_key
+    )
+    if not seeds:
+        return {
+            "base": base_method,
+            "target": target_method,
+            "paired_seeds": 0,
+            "note": "No paired seeds available.",
+        }
+
+    net_deltas = []
+    dealin_deltas = []
+    hu_deltas = []
+    step_deltas = []
+    for seed in seeds:
+        base = by_key[(seed, base_method)]
+        target = by_key[(seed, target_method)]
+        net_deltas.append(float(target["agent_net"]) - float(base["agent_net"]))
+        dealin_deltas.append(float(target["agent_dealin"]) - float(base["agent_dealin"]))
+        hu_deltas.append(float(target["agent_hu"]) - float(base["agent_hu"]))
+        step_deltas.append(float(target["steps"]) - float(base["steps"]))
+
+    def avg(values: List[float]) -> float:
+        return sum(values) / len(values) if values else 0.0
+
+    return {
+        "base": base_method,
+        "target": target_method,
+        "paired_seeds": len(seeds),
+        "avg_delta_net": avg(net_deltas),
+        "avg_delta_dealin_rate": avg(dealin_deltas),
+        "avg_delta_hu_rate": avg(hu_deltas),
+        "avg_delta_steps": avg(step_deltas),
+        "net_positive_rate": sum(1 for d in net_deltas if d > 0) / len(net_deltas),
+        "net_sign_test_p": sign_test_p_value(net_deltas),
+        "gate1_direction": {
+            "score_improved": avg(net_deltas) > 0,
+            "dealin_not_worse": avg(dealin_deltas) <= 0,
+            "interpretation": "Use only as smoke-test direction unless backend is a trained/local LLM and games are large enough.",
+        },
+    }
